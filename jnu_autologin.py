@@ -8,6 +8,7 @@ JNU ePortal 校园网自动登录脚本(开源版)
   2. 登录成功后定时发送 keepalive,防止空闲被踢
   3. WiFi 完全断开时持续重试,WiFi 自动重连后自动登录
   4. 自动完成门户 RSA 加密,只需提供校园网账号和密码即可使用
+  5. 弱网优化:IPv4 优先、门户 IP 兜底(DNS 未就绪也能登)、302 误判修正
 
 快速开始:
   python jnu_autologin.py --configure   # 首次配置:输入账号密码,生成 config.json
@@ -23,6 +24,7 @@ JNU ePortal 校园网自动登录脚本(开源版)
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import time
@@ -30,6 +32,23 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+
+# ---- IPv4 优先 ----
+# 校园网的 IPv6 常有默认路由但出口不通,urllib 会按地址逐个串行尝试,
+# 每个连不通的 IPv6 地址都要白等一个完整 timeout(实测百度每次 6s)。
+# 把 IPv4 地址排到前面,IPv6 只作为兜底。
+_socket_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_ipv4_first(host, port, family=0, type=0, proto=0, flags=0):
+    infos = _socket_getaddrinfo(host, port, family, type, proto, flags)
+    v4 = [i for i in infos if i[0] == socket.AF_INET]
+    if v4 and len(v4) < len(infos):
+        return v4 + [i for i in infos if i[0] != socket.AF_INET]
+    return infos
+
+
+socket.getaddrinfo = _getaddrinfo_ipv4_first
 
 # 控制台尽量用 UTF-8 输出(出错也不影响)
 try:
@@ -51,7 +70,7 @@ DEFAULT_CONFIG = {
     "service": "",             # 认证服务,留空使用默认
     "portal": "https://webauthsa.jnu.edu.cn:8443/eportal",
     "check_interval": 5,       # 在线时探测间隔(秒)
-    "retry_interval": 3,       # 登录失败重试间隔(秒)
+    "retry_interval": 2,       # 登录失败重试间隔(秒)
     "keepalive_interval": 60,  # 保活间隔(秒),登录成功后会被服务器返回值覆盖
 }
 
@@ -167,7 +186,7 @@ def fetch_public_key(portal):
     """
     url = portal.rstrip("/") + "/"
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    html = urllib.request.urlopen(req, context=SSL_CTX, timeout=10).read()
+    html = urllib.request.urlopen(req, context=SSL_CTX, timeout=4).read()   # 与登录超时一致,失败就回退明文
     html = html.decode("utf-8", errors="ignore")
     m = re.search(r'publicKey[^>]*value=["\']([0-9a-fA-F]+)&([0-9a-fA-F]+)["\']', html)
     if not m:
@@ -213,6 +232,40 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 _opener = urllib.request.build_opener(_NoRedirect)
 
+# ======================== 门户 IP(绕过 DNS 兜底) ========================
+# 上次解析到的门户地址。只在 DNS 不可用时兜底(能解析时下面每次都会刷新),
+# 这样 WiFi 刚连上、DNS 还没就绪时也能直接找门户登录。
+_PORTAL_IP = "192.168.11.68"
+
+
+def _portal_ip(portal):
+    """解析门户 IPv4 并缓存;解析不了就返回上次的地址。"""
+    global _PORTAL_IP
+    u = urllib.parse.urlparse(portal or DEFAULT_CONFIG["portal"])
+    try:
+        infos = socket.getaddrinfo(u.hostname, u.port or 443,
+                                   socket.AF_INET, socket.SOCK_STREAM)
+        if infos:
+            _PORTAL_IP = infos[0][4][0]
+    except Exception:
+        pass
+    return _PORTAL_IP
+
+
+def _portal_ip_url(url, portal):
+    """把门户 URL 的域名换成缓存 IP(端口/路径/参数不变);非门户地址/拿不到 IP 返回 None。"""
+    portal = portal or DEFAULT_CONFIG["portal"]
+    u = urllib.parse.urlparse(url)
+    portal_host = urllib.parse.urlparse(portal).hostname or ""
+    if not portal_host or (u.hostname or "").lower() != portal_host.lower():
+        return None
+    ip = _portal_ip(portal)
+    if not ip or not u.hostname:
+        return None
+    host = ip if ":" not in ip else "[" + ip + "]"
+    netloc = host + (":" + str(u.port) if u.port else "")
+    return urllib.parse.urlunparse(u._replace(netloc=netloc))
+
 
 def _qs_from_url(url):
     return urllib.parse.urlparse(url).query
@@ -231,12 +284,54 @@ def _qs_from_html(html):
     return None
 
 
-def probe():
+def _same_site(url, loc):
+    """302 是目标站自己的跳转(如百度 http->https)还是门户劫持?"""
+    a = (urllib.parse.urlparse(url).hostname or "").lower()
+    b = (urllib.parse.urlparse(loc).hostname or "").lower()
+    if not b:
+        return True          # 相对跳转,算同一个站
+    if a.startswith("www."):
+        a = a[4:]
+    if b.startswith("www."):
+        b = b[4:]
+    return a == b or a.endswith("." + b) or b.endswith("." + a)
+
+
+def _probe_portal_direct(portal):
+    """
+    直连门户(走缓存 IP,不依赖外网 DNS)。
+    返回 (online, queryString, info);连不上门户返回 None,交给上层报"WiFi 可能断开"。
+    """
+    ip = _portal_ip(portal)
+    if not ip:
+        return None
+    req = urllib.request.Request("http://" + ip + "/", headers={
+        "User-Agent": UA,
+        "Host": urllib.parse.urlparse(portal).netloc,
+    })
+    try:
+        resp = _opener.open(req, timeout=2)
+        body = resp.read(4096).decode("utf-8", errors="ignore")
+        if "eportal" in body.lower() or "InterFace" in body:
+            qs = _qs_from_html(body) or _qs_from_url(resp.geturl())
+            return False, qs, f"门户直达({ip})"
+        return True, None, f"在线(门户直达 {ip})"
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location", "")
+        if "redirectortosuccess" in loc.lower():
+            return True, None, f"在线(门户直达 {ip})"
+        return False, _qs_from_url(loc), f"门户直达-> {loc}"
+    except Exception:
+        return None
+
+
+def probe(portal=None):
     """
     探测当前是否已联网。
     返回 (online: bool, query_string: str|None, info: str)。
     掉线时 query_string 是从门户跳转/页面里抓到的参数,登录要用。
     """
+    portal = portal or DEFAULT_CONFIG["portal"]
     for url in PROBE_URLS:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
@@ -251,6 +346,9 @@ def probe():
         except urllib.error.HTTPError as e:
             loc = e.headers.get("Location", "")
             if loc:
+                if _same_site(url, loc):
+                    # 目标站自己的跳转(如百度 http->https),说明外网通的,不是门户劫持
+                    return True, None, f"在线({url} -> {loc})"
                 qs = _qs_from_url(loc)
                 if not qs:
                     try:
@@ -262,21 +360,43 @@ def probe():
                 return False, qs, f"跳转-> {loc}"
         except Exception:
             continue
+    # 外网探测全失败:也可能只是 DNS 没就绪(WiFi 刚连上)。直接问门户自己,
+    # 用缓存 IP 绕过 DNS,通常能拿到登录要用的 queryString。
+    direct = _probe_portal_direct(portal)
+    if direct is not None:
+        return direct
     return False, None, "探测全部失败(WiFi 可能完全断开)"
 
 
 # ======================== 登录 / 保活 / 下线 ========================
-def _post(url, fields, use_ssl=True):
+def _post(url, fields, use_ssl=True, portal=None):
+    """POST 到门户。域名解析不了时,自动改用缓存的门户 IP + Host 头再试一次。"""
     data = urllib.parse.urlencode(fields).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={
-        "User-Agent": UA,
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    })
-    kw = {"timeout": 10}
+    kw = {"timeout": 4}      # 原来 10s:门户卡住时白等太久,快速失败+重试更快
     if use_ssl:
         kw["context"] = SSL_CTX
-    resp = urllib.request.urlopen(req, **kw)
-    return resp.read().decode("utf-8", errors="ignore")
+
+    def _once(target, host_header=None):
+        headers = {
+            "User-Agent": UA,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        if host_header:
+            headers["Host"] = host_header
+        req = urllib.request.Request(target, data=data, headers=headers)
+        return urllib.request.urlopen(req, **kw).read().decode("utf-8", errors="ignore")
+
+    try:
+        return _once(url)
+    except (urllib.error.URLError, socket.gaierror) as e:
+        # 只有"域名解析失败"才值得换 IP 重试;超时/被拒交给上层重试
+        reason = getattr(e, "reason", e)
+        if not isinstance(reason, socket.gaierror):
+            raise
+        alt = _portal_ip_url(url, portal)
+        if not alt or alt == url:
+            raise
+        return _once(alt, urllib.parse.urlparse(url).netloc)
 
 
 def _login_fields(cfg, query_string):
@@ -309,7 +429,7 @@ def _login_fields(cfg, query_string):
 def login(query_string, cfg):
     portal = cfg.get("portal") or DEFAULT_CONFIG["portal"]
     text = _post(portal.rstrip("/") + "/InterFace.do?method=login",
-                 _login_fields(cfg, query_string))
+                 _login_fields(cfg, query_string), portal=portal)
     try:
         return json.loads(text)
     except Exception:
@@ -319,7 +439,7 @@ def login(query_string, cfg):
 def keepalive(user_index, portal):
     try:
         return json.loads(_post(portal.rstrip("/") + "/InterFace.do?method=keepalive",
-                                {"userIndex": user_index}))
+                                {"userIndex": user_index}, portal=portal))
     except Exception as e:
         return {"result": "fail", "message": str(e)}
 
@@ -328,7 +448,7 @@ def get_user_index(portal):
     """通过本机 IP 识别当前会话,返回 userIndex(在线时有效)。"""
     try:
         r = json.loads(_post(portal.rstrip("/") + "/InterFace.do?method=getOnlineUserInfo",
-                             {"userIndex": ""}))
+                             {"userIndex": ""}, portal=portal))
         ui = r.get("userIndex")
         if ui and r.get("userId"):
             return ui
@@ -341,7 +461,7 @@ def logout(user_index, portal):
     """用 userIndex 主动下线。"""
     try:
         return json.loads(_post(portal.rstrip("/") + "/InterFace.do?method=logout",
-                                {"userIndex": user_index}))
+                                {"userIndex": user_index}, portal=portal))
     except Exception as e:
         return {"result": "fail", "message": str(e)}
 
@@ -349,7 +469,6 @@ def logout(user_index, portal):
 # ======================== 主循环 ========================
 def run_daemon(cfg):
     # 单实例锁:占用一个本地端口,进程退出自动释放
-    import socket
     _lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         _lock.bind(("127.0.0.1", 47823))
@@ -360,13 +479,15 @@ def run_daemon(cfg):
     log("JNU ePortal 自动登录已启动(守护模式)")
     log(f"账号={mask_account(cfg.get('username'))}  探测间隔={cfg['check_interval']}s  "
         f"保活间隔={cfg['keepalive_interval']}s  密码模式={cfg.get('password_mode', 'auto')}")
+    log("探测参数: IPv4 优先 / 探测超时=3s / 登录超时=4s / "
+        f"失败重试={cfg.get('retry_interval')}s / 门户IP兜底={_PORTAL_IP}")
     user_index = None
     ka_interval = int(cfg.get("keepalive_interval") or DEFAULT_CONFIG["keepalive_interval"])
     last_ka = 0.0
     was_online = True  # 只在状态变化时记日志,避免刷屏
     while True:
         try:
-            online, qs, info = probe()
+            online, qs, info = probe(portal)
             if online:
                 if not was_online:
                     log("★ 网络已恢复(在线)")
@@ -406,7 +527,7 @@ def run_daemon(cfg):
 def run_once(cfg):
     portal = cfg.get("portal") or DEFAULT_CONFIG["portal"]
     log("单次测试模式")
-    online, qs, info = probe()
+    online, qs, info = probe(portal)
     log(f"探测结果: online={online}, info={info}")
     log(f"queryString: {qs}")
     if online:
@@ -433,7 +554,7 @@ def run_selftest(cfg):
     else:
         log("  拿不到 userIndex(可能已掉线),直接测登录。")
     log("第4步:探测网络 + 自动登录...")
-    online, qs, info = probe()
+    online, qs, info = probe(portal)
     log(f"探测: online={online}, info={info}")
     log(f"queryString: {qs}")
     if online:

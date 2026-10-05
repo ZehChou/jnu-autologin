@@ -6,6 +6,6 @@
   "service": "",
   "portal": "https://webauthsa.jnu.edu.cn:8443/eportal",
   "check_interval": 5,
-  "retry_interval": 3,
+  "retry_interval": 2,
   "keepalive_interval": 60
 }
